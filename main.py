@@ -9,8 +9,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 
 API_TOKEN = "8544825319:AAH5p7uWc01O5yoH84wNBMrrfGELjifkhzQ"
-
-REPORT_THREAD_ID = 8  # ID темы "ОТЧЕТЫ"
+REPORT_THREAD_ID = 8  # тема "ОТЧЕТЫ"
 
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher()
@@ -30,9 +29,7 @@ CREATE TABLE IF NOT EXISTS messages (
     thread_id INTEGER,
     phone TEXT,
     username TEXT,
-    message_id INTEGER,
-    date TEXT,
-    PRIMARY KEY (chat_id, thread_id, phone)
+    date TEXT
 )
 """)
 conn.commit()
@@ -41,58 +38,45 @@ conn.commit()
 def extract_phones(text: str):
     return re.findall(r"\+77\d{9}", text or "")
 
-def extract_username_from_text(text: str):
-    match = re.search(r"@[\w\d_]+", text or "")
-    return match.group(0) if match else None
-
-def is_valid_report_message(text: str):
-    t = (text or "").lower()
-    if "слетел" in t:
-        return False
-    if "встал" not in t:
-        return False
-    if not extract_phones(text):
-        return False
-    if not extract_username_from_text(text):
-        return False
-    return True
+def extract_username(text: str):
+    users = re.findall(r"@[\w\d_]+", text or "")
+    return users[-1] if users else None
 
 def calc_price(count: int):
-    if count == 0:
-        return 0
     if count >= 5:
         return count * 6
     return count * 5.5
 
-# ================= SAVE + EDIT =================
+# ================= SAVE MESSAGES =================
 @dp.message(F.chat.type.in_({"group", "supergroup"}))
 @dp.edited_message(F.chat.type.in_({"group", "supergroup"}))
-async def save_or_update_message(msg: types.Message):
+async def save_message(msg: types.Message):
     if msg.message_thread_id != REPORT_THREAD_ID:
         return
     if not msg.text:
         return
-    if not is_valid_report_message(msg.text):
+    if "слетел" in msg.text.lower():
         return
 
     phones = extract_phones(msg.text)
-    username = extract_username_from_text(msg.text)
+    username = extract_username(msg.text)
+
+    if not phones or not username:
+        return
+
     date = datetime.now().strftime("%Y-%m-%d")
 
-    chat_id = msg.chat.id
-    thread_id = msg.message_thread_id or 0
-
-    cursor.execute("""
-        DELETE FROM messages
-        WHERE chat_id = ? AND thread_id = ? AND message_id = ?
-    """, (chat_id, thread_id, msg.message_id))
-
-    for phone in set(phones):
+    for phone in phones:
         cursor.execute("""
-            INSERT OR IGNORE INTO messages
-            (chat_id, thread_id, phone, username, message_id, date)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, (chat_id, thread_id, phone, username, msg.message_id, date))
+            INSERT INTO messages (chat_id, thread_id, phone, username, date)
+            VALUES (?, ?, ?, ?, ?)
+        """, (
+            msg.chat.id,
+            msg.message_thread_id,
+            phone,
+            username,
+            date
+        ))
 
     conn.commit()
 
@@ -116,47 +100,44 @@ async def choose_date(call: types.CallbackQuery, state: FSMContext):
     await state.set_state(ReportState.waiting_date)
 
 # ================= DATE SELECT =================
-@dp.callback_query(F.data.in_(["date_today", "date_yesterday", "date_custom"]))
-async def set_date(call: types.CallbackQuery, state: FSMContext):
-    if call.data == "date_today":
-        date = datetime.now().strftime("%Y-%m-%d")
-    elif call.data == "date_yesterday":
-        date = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
-    else:
-        await call.message.edit_text("Отправь дату в формате YYYY-MM-DD")
-        return
+@dp.callback_query(F.data.in_(["date_today", "date_yesterday"]))
+async def set_quick_date(call: types.CallbackQuery, state: FSMContext):
+    date = datetime.now() if call.data == "date_today" else datetime.now() - timedelta(days=1)
+    date = date.strftime("%Y-%m-%d")
 
     await state.update_data(date=date)
     await state.set_state(ReportState.waiting_numbers)
     await call.message.edit_text(
-        f"Дата выбрана: {date}\n\n"
-        "Теперь отправь номера телефонов\n"
-        "(через пробел или с новой строки)"
+        f"📅 Дата: {date}\n\nОтправь номера (+77...)"
     )
+
+@dp.callback_query(F.data == "date_custom")
+async def custom_date_request(call: types.CallbackQuery):
+    await call.message.edit_text("Отправь дату в формате YYYY-MM-DD")
 
 # ================= CUSTOM DATE =================
 @dp.message(ReportState.waiting_date)
-async def custom_date(msg: types.Message, state: FSMContext):
+async def set_custom_date(msg: types.Message, state: FSMContext):
     try:
         datetime.strptime(msg.text, "%Y-%m-%d")
     except ValueError:
-        await msg.answer("❌ Неверный формат. Нужно YYYY-MM-DD")
+        await msg.answer("❌ Неверный формат даты")
         return
 
     await state.update_data(date=msg.text)
     await state.set_state(ReportState.waiting_numbers)
-    await msg.answer("Теперь отправь номера телефонов")
+    await msg.answer("Теперь отправь номера (+77...)")
 
 # ================= BUILD REPORT =================
 @dp.message(ReportState.waiting_numbers)
 async def build_report(msg: types.Message, state: FSMContext):
-    data = await state.get_data()
-    date = data["date"]
-
     numbers = extract_phones(msg.text)
     if not numbers:
-        await msg.answer("❌ Я не нашёл номера +77...")
+        await msg.answer("❌ Номера не найдены")
         return
+
+    data = await state.get_data()
+    date = data["date"]
 
     cursor.execute(f"""
         SELECT username, phone FROM messages
@@ -165,13 +146,13 @@ async def build_report(msg: types.Message, state: FSMContext):
 
     rows = cursor.fetchall()
     if not rows:
-        await msg.answer("❌ Нет данных")
+        await msg.answer("❌ Нет данных за эту дату")
         await state.clear()
         return
 
     users = {}
-    for username, phone in rows:
-        users.setdefault(username, set()).add(phone)
+    for user, phone in rows:
+        users.setdefault(user, set()).add(phone)
 
     report = f"ОТЧЕТ БХ ({date})\n\n"
     total = 0
